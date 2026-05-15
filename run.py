@@ -302,7 +302,7 @@ def execute_aggregation_query(sql_template):
 
             return row
     except pymysql.MySQLError as e:
-        print(f"WARNING: 聚合查询执行失败: {e}", file=sys.stderr)
+        print(f"WARNING: 聚合查询执行失败: {e}; SQL={sql}", file=sys.stderr)
         return None
     finally:
         if conn:
