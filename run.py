@@ -3,7 +3,10 @@ import re
 import sys
 import os
 import json
-import pymysql
+try:
+    import pymysql
+except ImportError:
+    pymysql = None
 import math
 import urllib.request
 import urllib.error
@@ -102,6 +105,187 @@ AGGREGATION_FALLBACK = {
 }
 
 # ------------------------------
+# LLM 问题类型识别器
+# ------------------------------
+LLM_CLASSIFIER_SYSTEM_PROMPT = """你是养老规划 Agent 的问题类型识别器。
+
+你的任务：
+根据用户问题判断标准问题类型，只输出一个类型字符串。
+不要回答问题，不要解释，不要输出 JSON，不要输出 Markdown。
+
+只能返回以下类型之一：
+客户信息查询-年龄
+客户信息查询-退休
+客户行为偏好分析
+客户购买预测
+聚合查询
+养老金缺口计算-月支出
+养老金缺口计算-最低积累
+养老金缺口计算-可积累
+投资配置建议
+综合建议书生成
+未知
+
+判断原则：
+
+1. 如果用户要求生成建议书、规划报告、养老规划方案，返回：
+综合建议书生成
+
+2. 如果问题没有单个客户ID，并且出现“年龄/风险评级/净资产/月收入/月支出”等字段，同时询问“数量/人数/统计一下/多少个/多少人”，必须返回：
+聚合查询
+
+3. 如果问题询问某个客户当前年龄、几岁、多大，返回：
+客户信息查询-年龄
+
+4. 如果问题询问某个客户距离退休多久、什么时候退休、还要上几年班，返回：
+客户信息查询-退休
+
+5. 如果问题询问某个客户历史上更偏好什么产品、行为最多、最常浏览、最常购买、最感兴趣，返回：
+客户行为偏好分析
+
+6. 如果问题询问某个客户未来一周、下周、接下来最可能购买什么产品，返回：
+客户购买预测
+注意：必须出现“购买/买/会买/可能买/预测购买”等购买意图；仅出现“未来”不算客户购买预测。
+
+7. 如果问题询问某个客户刚退休时、退休后为了保持消费水平，每月需要花多少钱，返回：
+养老金缺口计算-月支出
+
+8. 如果问题询问某个客户退休时最低需要积攒多少钱、至少准备多少钱、养老缺口是多少、要补多少钱，返回：
+养老金缺口计算-最低积累
+
+9. 如果问题询问某个客户到退休时能攒多少钱、可以积累多少钱、能剩下多少养老本金，返回：
+养老金缺口计算-可积累
+
+10. 如果问题询问如何投资、如何配置、定期存款能否达成目标、收益最大化、最小化风险、增加什么产品配置，返回：
+投资配置建议
+
+特殊规则：
+- 有明确客户ID且问“多少钱/每月多少钱/最低攒多少钱/能攒多少钱”，通常不是聚合查询。
+- “消费水平不下降”只是养老目标，不是问题类型。
+- “如果/假设/未来”不是问题类型，继续看用户最终要做什么。
+- 如果问题里同时有“生成建议书”和“资产配置”，优先返回综合建议书生成。
+- “预期未来寿命延长到90岁，最可能增加什么产品配置”返回投资配置建议，不是客户购买预测。
+- “浏览权益类产品2次以上的客户平均年龄”返回聚合查询。
+
+只输出类型字符串。
+"""
+
+VALID_QTYPES = {
+    "客户信息查询-年龄",
+    "客户信息查询-退休",
+    "客户行为偏好分析",
+    "客户购买预测",
+    "聚合查询",
+    "养老金缺口计算-月支出",
+    "养老金缺口计算-最低积累",
+    "养老金缺口计算-可积累",
+    "投资配置建议",
+    "综合建议书生成",
+    "未知",
+}
+
+
+def normalize_llm_qtype(raw_text):
+    text = (raw_text or "").strip()
+
+    if not text:
+        return "未知"
+
+    # 去掉可能的 Markdown 代码块
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:text|json)?\s*", "", text, flags=re.IGNORECASE)
+        text = re.sub(r"\s*```$", "", text)
+
+    text = text.strip()
+
+    # 去掉常见前缀
+    text = re.sub(r"^(问题类型|类型|qtype|标准类型)\s*[:：]\s*", "", text, flags=re.IGNORECASE)
+
+    # 只取第一行，防止模型多说
+    text = text.splitlines()[0].strip()
+
+    # 精确命中
+    if text in VALID_QTYPES:
+        return text
+
+    # 容错：如果模型输出里包含标准类型，取第一个匹配
+    for qtype in VALID_QTYPES:
+        if qtype != "未知" and qtype in text:
+            return qtype
+
+    return "未知"
+
+
+def llm_classify_question(question):
+    user_prompt = f"""请判断下面问题的标准问题类型，只输出标准类型字符串。
+
+用户问题：
+{question}
+"""
+    content = call_one_api_chat([
+        {"role": "system", "content": LLM_CLASSIFIER_SYSTEM_PROMPT},
+        {"role": "user", "content": user_prompt},
+    ])
+    return normalize_llm_qtype(content)
+
+
+def should_use_llm_classifier(question, rule_qtype):
+    q = (question or "").lower()
+    user_id = extract_user_id(question or "")
+
+    # 规则识别失败，必须调用
+    if rule_qtype == "未知":
+        return True
+
+    # 有客户ID但被误识别成聚合查询，交给 LLM 纠正
+    if user_id and rule_qtype == "聚合查询":
+        return True
+
+    # 仅有“未来”但没有购买含义，不应直接判购买预测
+    if rule_qtype == "客户购买预测":
+        has_buy_intent = any(k in q for k in [
+            "买", "购买", "会买", "可能买", "最可能购买", "预测购买", "大概率会买"
+        ])
+        if not has_buy_intent:
+            return True
+
+        # 寿命/通胀这类“未来”不是购买预测
+        if any(k in q for k in ["寿命", "通胀", "收益率", "退休年龄"]):
+            return True
+
+    # 投资配置建议和金额计算冲突时，让 LLM 决策
+    if rule_qtype == "投资配置建议":
+        money_calc_clues = [
+            "刚退休", "每月需要", "每月支出", "一个月", "最低需要积攒",
+            "最低需要攒", "最低积攒", "至少要攒", "可以积攒",
+            "能攒下", "能积攒", "养老缺口", "要补多少钱"
+        ]
+        if any(k in q for k in money_calc_clues):
+            return True
+
+    # 年龄查询不能误伤平均年龄
+    if rule_qtype == "客户信息查询-年龄" and "平均" in q:
+        return True
+    
+     # 没有客户ID，却被识别为单客户信息查询，通常需要重新判断
+    if rule_qtype in ["客户信息查询-年龄", "客户信息查询-退休"] and not extract_user_id(question or ""):
+        return True
+
+    return False
+
+
+def get_question_type(question):
+    rule_qtype = parse_question_type(question)
+
+    if should_use_llm_classifier(question, rule_qtype):
+        llm_qtype = llm_classify_question(question)
+
+        # LLM 有明确结果时用 LLM；否则回退规则
+        if llm_qtype != "未知":
+            return llm_qtype
+
+    return rule_qtype
+# ------------------------------
 # 产品库
 # ------------------------------
 PRODUCTS = [
@@ -126,6 +310,8 @@ RISK_ORDER = {
 # 数据库连接
 # ------------------------------
 def get_connection():
+    if pymysql is None:
+        raise RuntimeError("pymysql is not installed")
     return pymysql.connect(
         host=DB_HOST,
         port=DB_PORT,
@@ -342,7 +528,7 @@ def extract_user_id(question):
     if match:
         return match.group(1)
 
-    match = re.search(r"\b([A-Za-z]\d{6})\b", question)
+    match = re.search(r"(?<![A-Za-z0-9])([A-Za-z]\d{6})(?!\d)", question)
     if match:
         return match.group(1)
 
@@ -352,21 +538,51 @@ def extract_user_id(question):
 # ------------------------------
 # 假设条件解析：只解析默认条件变化，不决定任务类型
 # ------------------------------
+def parse_amount_text(text):
+    """
+    将中文口语金额转成数字：
+    10000元 -> 10000
+    1万 -> 10000
+    1万块 -> 10000
+    1.5万 -> 15000
+    """
+    if text is None:
+        return None
+
+    text = str(text).strip()
+
+    m = re.search(r"(\d+(?:\.\d+)?)\s*万", text)
+    if m:
+        return int(round(float(m.group(1)) * 10000))
+
+    m = re.search(r"(\d+(?:\.\d+)?)\s*(?:元|块|块钱)?", text)
+    if m:
+        return int(round(float(m.group(1))))
+
+    return None
+
+
 def parse_scenario_overrides(question):
-    q = question.lower()
+    q = (question or "").lower()
     scenario = {}
 
-    has_scenario_word = any(k in q for k in ["如果", "假如", "假设", "若", "假定", "万一"])
+    has_scenario_word = any(k in q for k in ["如果", "假如", "假设", "若", "假定", "万一", "要是"])
 
     # 1. 预期寿命变化：默认 80 岁
-    life_match = re.search(r"(?:预期寿命|人均寿命|寿命|活到|延长到)[^\d]*(\d{2,3})\s*岁?", q)
+    life_match = re.search(
+        r"(?:预期寿命|人均寿命|寿命|活到|延长到|活到|能活到)[^\d]*(\d{2,3})\s*岁?",
+        q
+    )
     if life_match:
         new_life = int(life_match.group(1))
         if new_life != EXPECTED_AGE:
             scenario["expected_age"] = new_life
 
     # 2. 通胀率变化：默认 2%
-    inflation_match = re.search(r"(?:通胀率|通胀)[^\d]*(\d+(?:\.\d+)?)\s*%", q)
+    inflation_match = re.search(
+        r"(?:通胀率|通胀)[^\d]*(\d+(?:\.\d+)?)\s*%",
+        q
+    )
     if inflation_match:
         new_inflation = float(inflation_match.group(1)) / 100
         if abs(new_inflation - INFLATION_RATE) > 1e-12:
@@ -377,116 +593,132 @@ def parse_scenario_overrides(question):
                 scenario["inflation_effective_after_years"] = int(after_match.group(1))
 
     # 3. 投资回报率变化：默认 2%
-    invest_match = re.search(r"(?:投资回报率|默认投资回报率|投资收益率|收益率)[^\d]*(\d+(?:\.\d+)?)\s*%", q)
+    # 覆盖：投资年化4%、年化能做到4%、默认收益率按4%、收益按4%、投资收益4%
+    invest_match = re.search(
+        r"(?:投资回报率|默认投资回报率|投资收益率|投资收益|收益率|默认收益率|年化收益率|年化收益|投资年化|年化)[^\d]*(\d+(?:\.\d+)?)\s*%",
+        q
+    )
     if invest_match:
         new_return = float(invest_match.group(1)) / 100
         if abs(new_return - INVEST_RATE) > 1e-12:
             scenario["invest_rate"] = new_return
 
     # 4. 指定退休年龄
-    retirement_match = re.search(r"(?:退休年龄|退休)[^\d]*(\d{2})\s*岁", q)
-    if retirement_match and has_scenario_word:
-        scenario["retirement_age"] = int(retirement_match.group(1))
+    # 覆盖：假设65岁退休 / 干到65岁再退休 / 退休年龄改成65岁
+    retirement_patterns = [
+        r"(?:退休年龄|退休)[^\d]*(\d{2})\s*岁",
+        r"(?:干到|工作到|做到|上班到)[^\d]*(\d{2})\s*岁.*?(?:退休|退)",
+        r"(\d{2})\s*岁.*?(?:退休|退)"
+    ]
+
+    for pattern in retirement_patterns:
+        retirement_match = re.search(pattern, q)
+        if retirement_match and has_scenario_word:
+            new_retire_age = int(retirement_match.group(1))
+
+            # 避免把“活到90岁”误识别为退休年龄
+            if 50 <= new_retire_age <= 70:
+                scenario["retirement_age"] = new_retire_age
+                break
 
     # 5. 指定退休后每月支出目标
-    goal_match = re.search(r"退休后.*?每月.*?(\d+)\s*元", q)
-    if goal_match:
-        scenario["retirement_monthly_goal"] = int(goal_match.group(1))
+    # 覆盖：退休后每月10000元 / 每个月花1万块 / 退休后想每个月花1万
+    goal_patterns = [
+        r"退休后.*?每(?:个)?月.*?(\d+(?:\.\d+)?\s*(?:万|元|块|块钱)?)",
+        r"每(?:个)?月.*?(?:花|支出|消费|用).*?(\d+(?:\.\d+)?\s*(?:万|元|块|块钱)?)",
+        r"退休后.*?(?:花|支出|消费|用).*?(\d+(?:\.\d+)?\s*(?:万|元|块|块钱)?)"
+    ]
+
+    for pattern in goal_patterns:
+        goal_match = re.search(pattern, q)
+        if goal_match:
+            amount = parse_amount_text(goal_match.group(1))
+            if amount is not None and amount > 0:
+                scenario["retirement_monthly_goal"] = amount
+                break
 
     return scenario
-
 
 # ------------------------------
 # 问题类型识别：只判断用户要做什么任务
 # ------------------------------
 def parse_question_type(question):
-    q = question.lower()
+    q = (question or "").strip().lower()
+    user_id = extract_user_id(question or "")
 
-    # 1. 客户信息查询
-    if any(k in q for k in ["多大", "几岁", "岁数", "年龄"]):
-        return "客户信息查询-年龄"
+    # 建议书优先级最高
+    if any(k in q for k in ["建议书", "规划建议书", "养老规划报告", "规划报告"]):
+        return "综合建议书生成"
 
-    if any(k in q for k in ["退休还有多久", "距离退休", "多久退休"]):
-        return "客户信息查询-退休"
+    # 聚合查询（群体统计）
+    agg_words = ["有多少客户", "客户有多少", "客户数量", "平均", "总和", "总计", "最大", "最小", "均值", "一共", "总共", "几个"]
+    agg_scope = ["客户", "年龄", "净资产", "月收入", "月支出", "退休金", "企业年金", "风险评级", "浏览", "购买", "收藏", "次"]
+    if user_id is None and (
+            any(k in q for k in agg_words)
+            or (("多少" in q or "几个" in q) and "客户" in q)
+            or (("浏览" in q or "购买" in q or "收藏" in q or "看过" in q) and ("平均" in q or "多少" in q))
+    ) and any(k in q for k in agg_scope):
+        return "聚合查询"
 
-    # 2. 客户购买预测
+    # 客户购买预测（未来）
     if any(k in q for k in [
-        "未来一个星期",
-        "未来一周",
-        "未来7天",
-        "未来七天",
-        "最可能购买",
-        "可能购买",
-        "预测购买",
-        "接下来会买",
-        "后续会买",
-        "未来会买"
+        "未来一个星期", "未来一周", "未来 7 天", "未来7天", "未来七天",
+        "下周", "接下来", "后续", "最可能购买", "最可能会买", "大概率会买",
+        "预测", "会买什么", "可能买什么", "可能购买什么"
     ]):
         return "客户购买预测"
 
-    # 3. 单客户行为偏好分析
+    # 客户行为偏好分析（历史）
     if any(k in q for k in [
-        "行为最多",
-        "最偏好",
-        "偏好",
-        "最常浏览",
-        "最常买",
-        "买得最多",
-        "购买最多",
-        "喜欢什么产品",
-        "感兴趣",
-        "对什么类型的产品行为最多",
-        "什么产品行为最多",
-        "哪类产品更感兴趣",
-        "最可能喜欢"
+        "行为最多", "最偏好", "更偏好", "偏好哪类", "最常浏览", "最常买", "买得最多",
+        "购买最多", "更爱看", "感兴趣", "哪类产品行为最多", "对什么类型的产品行为最多"
     ]):
         return "客户行为偏好分析"
 
-    # 8. 建议书
-    if any(k in q for k in ["建议书", "养老规划", "规划建议"]):
-        return "综合建议书生成"
-
-    # 4. 投资配置建议
-    if (
-            any(k in q for k in ["全部投资", "定期存款", "投资组合", "资产配置", "配置方案"])
-            or any(k in q for k in ["能否达成", "能不能达成", "能达到", "达成目标", "达标"])
-            or any(k in q for k in ["如何调整", "怎么调整", "换什么产品", "改为投资"])
-            or any(k in q for k in ["最大化收益", "收益最大", "投资收益最大化"])
-            or any(k in q for k in ["最小化风险", "风险波动"])
-            or any(k in q for k in ["增加什么产品", "什么产品的配置", "增加什么", "增加哪类产品"])
-    ):
+    # 投资配置建议
+    if any(k in q for k in [
+        "资产配置", "配置方案", "怎么配", "如何配置", "配什么产品",
+        "全部投资", "只放", "定期存款", "能否达成目标", "达成目标", "不够换哪个产品",
+        "如何调整", "怎么调整", "收益最大化", "投资收益最大化", "最小化风险", "风险波动",
+        "增加什么产品", "增加什么配置", "加配什么产品"
+    ]):
         return "投资配置建议"
 
-    # 5. 养老金缺口计算-最低积累
+    # 养老金缺口计算-最低积累
     if any(k in q for k in [
-        "最低需要积攒",
-        "最低需要攒",
-        "最低积攒",
-        "退休时最低",
-        "最低需要多少钱",
-        "至少需要积攒",
-        "至少要攒"
+        "最低需要积攒", "最低需要攒", "最低积攒", "退休时最低", "至少得有多少养老钱",
+        "最低要准备多少钱", "至少要准备多少钱", "养老缺口是多少", "要补多少钱", "补多少钱才够养老",
+        "最低需要积攒多少钱", "至少要攒多少"
     ]):
         return "养老金缺口计算-最低积累"
 
-    # 6. 养老金缺口计算-可积累
+    # 养老金缺口计算-可积累
     if any(k in q for k in [
-        "可以积攒",
-        "能积攒",
-        "能攒下",
-        "积累下",
-        "退休时可以积攒",
-        "退休时能攒"
+        "可以积攒", "能积攒", "能攒下", "能攒多少", "退休时可以积攒", "退休时能攒",
+        "到退休能积累多少钱", "到退休能攒多少", "能剩下多少养老本金"
     ]):
         return "养老金缺口计算-可积累"
 
-    # 7. 养老金缺口计算-月支出
+    # 养老金缺口计算-月支出
     if (
-            any(k in q for k in ["刚退休时", "退休时", "退休后"])
-            and any(k in q for k in ["每月", "月"])
-            and any(k in q for k in ["支出", "花费", "消费", "需要多少钱", "需要多少"])
+            any(k in q for k in ["刚退休", "退休时", "退休后", "退休那天", "退休那个月"])
+            and any(k in q for k in ["每月", "一个月", "月"])
+            and any(k in q for k in ["支出", "花", "花销", "消费", "需要多少钱", "得花多少"])
     ):
         return "养老金缺口计算-月支出"
+
+    # 客户信息查询-退休
+    if any(k in q for k in [
+        "距离退休还有多久", "退休还有多久", "还得上几年班", "多久退休", "什么时候退休", "还能工作几年"
+    ]):
+        return "客户信息查询-退休"
+
+    # 客户信息查询-年龄
+    if (
+            any(k in q for k in ["年龄多大", "多大了", "几岁", "岁数", "现在年龄", "年龄"])
+            and "平均" not in q
+    ):
+        return "客户信息查询-年龄"
 
     return "未知"
 
@@ -692,21 +924,31 @@ def calculate_min_required_savings(user_id, scenario=None):
 
     retired_months = vals["retired_months"]
 
-    # Q14 分段通胀特殊逻辑
-    if "inflation_rate" in scenario and "inflation_effective_after_years" in scenario:
+    # 通胀变化逻辑：
+    # 1. 如果有 inflation_effective_after_years，说明 N 年后通胀变化；
+    # 2. 如果只有 inflation_rate，说明从现在开始新通胀率立即生效；
+    # 3. 退休后生活费也按新通胀率继续增长，并按默认投资回报率折现。
+    if "inflation_rate" in scenario:
         new_inflation_rate = scenario["inflation_rate"]
-
-        # 注意这里用未取整的退休时月支出更贴近 Q14 示例
         months_to_retirement = vals["months_to_retirement"]
-        first_months = min(int(scenario["inflation_effective_after_years"] * 12), months_to_retirement)
-        second_months = max(months_to_retirement - first_months, 0)
+
+        if "inflation_effective_after_years" in scenario:
+            first_months = min(
+                int(scenario["inflation_effective_after_years"] * 12),
+                months_to_retirement
+            )
+            second_months = max(months_to_retirement - first_months, 0)
+        else:
+            first_months = 0
+            second_months = months_to_retirement
 
         retired_monthly_float = vals["monthly_expend"]
         retired_monthly_float *= (1 + INFLATION_RATE / 12) ** first_months
         retired_monthly_float *= (1 + new_inflation_rate / 12) ** second_months
 
         life_need_pv = sum(
-            retired_monthly_float * (((1 + new_inflation_rate / 12) / (1 + INVEST_RATE / 12)) ** k)
+            retired_monthly_float
+            * (((1 + new_inflation_rate / 12) / (1 + INVEST_RATE / 12)) ** k)
             for k in range(retired_months)
         )
 
@@ -717,13 +959,11 @@ def calculate_min_required_savings(user_id, scenario=None):
 
         return int(round(life_need_pv - pension_pv))
 
-    # 常规 Q7 逻辑
+    # 常规 Q7 逻辑：没有通胀假设变化时，沿用题目示例口径
     total_need = retired_monthly * retired_months
 
-    inflation_rate = scenario.get("inflation_rate", INFLATION_RATE)
-
     pv_pension = sum(
-        vals["pension"] / ((1 + inflation_rate / 12) ** k)
+        vals["pension"] / ((1 + INFLATION_RATE / 12) ** k)
         for k in range(retired_months)
     )
 
@@ -792,13 +1032,12 @@ def summarize_retirement_goal(question, user_id, scenario=None):
         goal_parts.append(f"客户希望退休后每月可支出 {fmt_money(scenario['retirement_monthly_goal'])}")
 
     if not goal_parts:
-        goal_parts.append("客户默认养老目标为退休后消费水平不下降")
+        goal_parts.append("退休后消费水平不下降")
 
     if current_expend is not None and retired_monthly is not None:
         return (
                 "；".join(goal_parts)
-                + f"。当前每月支出为 {fmt_money(current_expend)}，按长期通胀率 {fmt_percent(INFLATION_RATE)} 测算，"
-                + f"客户刚退休时每月约需支出 {fmt_money(retired_monthly)}。"
+                + f"。每月可花费与当前 {fmt_money(current_expend)}购买力相同的金额（退休时约为{fmt_money(retired_monthly)}）"
         )
 
     return "；".join(goal_parts) + "。"
@@ -864,7 +1103,19 @@ def investment_allocation(user_id, question, scenario=None):
         return "无符合客户风险等级的产品可配置"
 
     # Q9：全部投资定期存款能否达标，如不能如何调整
-    if "定期存款" in q and any(k in q for k in ["能否", "能不能", "达成", "达到", "达标"]):
+    if "定期存款" in q and any(k in q for k in ["能否",
+                                                "能不能",
+                                                "能不能够",
+                                                "能达到",
+                                                "达到",
+                                                "达成",
+                                                "达标",
+                                                "够不够",
+                                                "够吗",
+                                                "够不",
+                                                "够养老",
+                                                "养老目标够",
+                                                "能覆盖",]):
         deposit_product = next((p for p in PRODUCTS if p["name"] == "定期存款"), None)
         deposit_rate = product_expected_return_median(deposit_product)
         deposit_accum = calculate_retirement_accumulation_by_rate(user_id, deposit_rate, scenario)
@@ -1026,6 +1277,190 @@ def customer_behavior_preference(user_id):
             conn.close()
 
 
+
+def customer_behavior_preference_detail(user_id):
+    """
+    返回客户行为最多的产品类别和行为次数。
+    复用 customer_behavior_preference 的产品映射与排序逻辑，只是多返回 cnt。
+    """
+    conn = None
+    try:
+        conn = get_connection()
+        with conn.cursor() as cursor:
+            sql = f"""
+                SELECT
+                    product,
+                    COUNT(*) AS cnt,
+                    SUM(CASE WHEN action_typ = '购买' THEN 1 ELSE 0 END) AS buy_cnt,
+                    MAX(acs_tm) AS last_time,
+                    MAX(priority) AS priority
+                FROM (
+                    SELECT
+                        CASE
+                            WHEN prod_sub_typ = '现金' THEN '现金理财'
+                            WHEN prod_sub_typ = '一般性' AND prod_typ = '存款' THEN '定期存款'
+                            WHEN prod_typ IN ('理财', '基金') AND rsk_lvl = 'R2' THEN '短债类产品'
+                            WHEN prod_typ IN ('理财', '基金') AND rsk_lvl = 'R3' THEN '固收+产品'
+                            WHEN prod_typ = '基金' AND rsk_lvl IN ('R4', 'R5') THEN '权益类产品'
+                            WHEN prod_sub_typ IN ('税延养老年金', '养老年金') THEN '年金险'
+                            ELSE '其他'
+                        END AS product,
+                        action_typ,
+                        acs_tm,
+                        CASE
+                            WHEN prod_sub_typ IN ('税延养老年金', '养老年金') THEN 7
+                            WHEN prod_typ IN ('理财', '基金') AND rsk_lvl = 'R3' THEN 6
+                            WHEN prod_typ IN ('理财', '基金') AND rsk_lvl = 'R2' THEN 5
+                            WHEN prod_typ = '基金' AND rsk_lvl IN ('R4', 'R5') THEN 4
+                            WHEN prod_sub_typ = '一般性' AND prod_typ = '存款' THEN 3
+                            WHEN prod_sub_typ = '现金' THEN 2
+                            ELSE 1
+                        END AS priority
+                    FROM {ACTION_TABLE}
+                    WHERE user_id = %s
+                      AND prod_typ <> '非财富'
+                ) T
+                GROUP BY product
+                ORDER BY cnt DESC, buy_cnt DESC, last_time DESC, priority DESC
+                LIMIT 1
+            """
+            cursor.execute(sql, (user_id,))
+            row = cursor.fetchone()
+
+            if not row:
+                return {
+                    "product": "暂无明确偏好",
+                    "count": 0
+                }
+
+            return {
+                "product": row["product"],
+                "count": int(row["cnt"])
+            }
+
+    except Exception:
+        return {
+            "product": "行为偏好查询失败",
+            "count": 0
+        }
+
+    finally:
+        if conn:
+            conn.close()
+
+
+def get_product_by_name(product_name):
+    for product in PRODUCTS:
+        if product["name"] == product_name:
+            return product
+    return None
+
+
+def parse_allocation_plan(allocation_plan):
+    """
+    解析 investment_allocation 返回的配置文本。
+
+    示例：
+    固收+产品配置 73%；现金理财 10%；年金险 17%
+    """
+    result = []
+
+    if not allocation_plan:
+        return result
+
+    parts = re.split(r"[；;]", allocation_plan)
+
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+
+        match = re.search(r"(.+?)(?:配置)?\s*(\d+)%", part)
+        if match:
+            product_name = match.group(1).strip()
+            pct = int(match.group(2))
+            result.append({
+                "product": product_name,
+                "pct": pct
+            })
+
+    return result
+
+
+def explain_allocation_with_gap_coverage(user_id, allocation_plan, scenario=None):
+    """
+    复用 investment_allocation 的配置结果，补充说明：
+    1. 客户风险评级；
+    2. 退休时最低需积攒金额；
+    3. 各产品按配置比例预计形成退休时资产；
+    4. 组合是否覆盖养老缺口。
+    """
+    if scenario is None:
+        scenario = {}
+
+    risk_level = query_customer_field(user_id, "Rsk_Cd") or "暂无数据"
+    min_required = calculate_min_required_savings(user_id, scenario)
+
+    parsed_plan = parse_allocation_plan(allocation_plan)
+
+    if not parsed_plan:
+        return (
+            f"客户风险评级为 {risk_level}，以下方案已按客户风险承受能力筛选产品：\n"
+            f"{allocation_plan}"
+        )
+
+    lines = []
+    total_cover = 0
+
+    for item in parsed_plan:
+        product_name = item["product"]
+        pct = item["pct"]
+
+        product = get_product_by_name(product_name)
+
+        if product is None:
+            lines.append(f"• 将 {pct}% 配置于{product_name}。")
+            continue
+
+        rate = product_expected_return_median(product)
+        full_accum = calculate_retirement_accumulation_by_rate(
+            user_id,
+            rate,
+            scenario
+        )
+
+        if full_accum is None:
+            cover_amount = None
+        else:
+            cover_amount = int(round(full_accum * pct / 100))
+            total_cover += cover_amount
+
+        lines.append(
+            f"• 将 {pct}% 配置于{product_name}（收益率中枢 {rate:.2%}），"
+            f"按该比例预计可形成退休时资产约 {fmt_money(cover_amount)}。"
+        )
+
+    if min_required is None:
+        coverage_summary = "暂无法测算该配置组合对养老缺口的覆盖情况。"
+    elif total_cover >= min_required:
+        coverage_summary = (
+            f"按上述配置测算，组合预计形成退休时资产约 {fmt_money(total_cover)}。"
+        )
+    else:
+        gap = min_required - total_cover
+        coverage_summary = (
+            f"按上述配置测算，组合预计形成退休时资产约 {fmt_money(total_cover)}，"
+            f"距离退休时最低需积攒金额 {fmt_money(min_required)} 仍差约 {fmt_money(gap)}。"
+        )
+
+    return (
+        f"客户风险评级为 {risk_level}，以下方案已按客户风险承受能力筛选产品：\n"
+        + "\n".join(lines)
+        + "\n"
+        + coverage_summary
+    )
+
+
 # ------------------------------
 # 客户购买预测 Skill
 # ------------------------------
@@ -1159,7 +1594,9 @@ def generate_retirement_report(user_id, question, scenario=None):
     else:
         gap_text = "预计可以覆盖养老目标。"
 
-    behavior_preference = customer_behavior_preference(user_id)
+    behavior_detail = customer_behavior_preference_detail(user_id)
+    behavior_preference = behavior_detail["product"]
+    behavior_count = behavior_detail["count"]
 
     # 资产配置方案：如果当前问题没明确偏好，默认用最小化风险波动方案
     q = question.lower()
@@ -1174,28 +1611,28 @@ def generate_retirement_report(user_id, question, scenario=None):
         allocation_title = "客户关注定期存款方案"
     else:
         allocation_question = f"客户 {user_id} 想要在满足养老需求基础上最小化风险波动，请为他提供资产配置方案。"
-        allocation_title = "默认采用满足养老目标基础上的稳健配置方案"
+        allocation_title = "客户想要满足养老目标基础上的稳健配置方案"
 
     allocation_plan = investment_allocation(user_id, allocation_question, scenario)
+    allocation_plan_detail = explain_allocation_with_gap_coverage(user_id, allocation_plan, scenario)
 
     report = f"""1. 基本情况
 客户 ID：{user_id}，年龄：{age} 岁，性别：{gender}，风险评级：{risk_level}。当前净资产：{fmt_money(net_asset)}，每月结余：{fmt_money(monthly_surplus)}（月收入 {fmt_money(monthly_income)} − 月支出 {fmt_money(monthly_expend)}）。每月退休金：{fmt_money(pension)}，企业年金（一次性提取）：{enterprise_ann_text}。
 
 2. 基本假设
-当前日期为 2025 年 3 月 31 日。预期寿命 {scenario.get("expected_age", EXPECTED_AGE)} 岁，长期通胀率 {fmt_percent(INFLATION_RATE)}，默认投资回报率 {fmt_percent(scenario.get("invest_rate", INVEST_RATE))}，按月复利计算。退休身份默认为干部，退休年龄按延迟退休政策测算为 {retirement_age_text}，距退休约 {retire_distance_text}。不考虑退休后养老金调整。
+预期寿命 {scenario.get("expected_age", EXPECTED_AGE)} 岁，长期通胀率 {fmt_percent(INFLATION_RATE)}，退休年龄为 {retirement_age_text}岁，距退休约 {retire_distance_text}。
 
 3. 养老目标
 {summarize_retirement_goal(question, user_id, scenario)}
 
 4. 退休后财富需求测算
-客户刚退休时每月预计支出约 {fmt_money(retired_monthly)}，退休后预计总生活费约 {fmt_money(total_need)}。每月退休金 {fmt_money(pension)} 按通胀率折现后可支撑约 {fmt_money(pension_pv)}，因此客户退休时最低需要积攒约 {fmt_money(min_required)}。按当前净资产与每月结余测算，客户退休时预计可积攒约 {fmt_money(total_savings)}，{gap_text}
-
+退休后预计总需求约 {fmt_money(total_need)}。其中退休金（先付年金现值）可支撑约 {fmt_money(pension_pv)}，还有 {fmt_money(min_required)}缺口需要通过投资积累来覆盖。
 5. 产品偏好
-根据客户历史浏览、购买、收藏等行为记录，客户对{behavior_preference}类产品行为最多，推测其更偏好相关产品。
+根据客户历史浏览、购买、收藏等行为记录，客户对{behavior_preference}类产品行为最多，共 {behavior_count} 次相关行为，推测其更偏好{behavior_preference}类产品。
 
 6. 资产配置方式与具体方案
 {allocation_title}：
-{allocation_plan}
+{allocation_plan_detail}
 
 7. 其他建议
 TODO：后续接入大模型后，可补充税务规划、家庭保障、医疗支出、长期护理、遗产安排、再平衡机制等综合建议。"""
@@ -1209,11 +1646,12 @@ TODO：后续接入大模型后，可补充税务规划、家庭保障、医疗�
 def handle_question(question):
     user_id = extract_user_id(question)
     scenario = parse_scenario_overrides(question)
-    qtype = parse_question_type(question)
 
-    # 聚合查询通常没有单个客户 ID。
-    # 必须放在 user_id 提取和普通 qtype 识别之后，避免把“客户 V500001 需要多少钱”误判成聚合查询。
-    if user_id is None and is_aggregation_query_candidate(question):
+    # 规则分类 + LLM fallback 分类
+    qtype = get_question_type(question)
+
+    # 1. 聚合查询
+    if qtype == "聚合查询":
         aggregation_raw = generate_aggregation_sql_json(question)
         try:
             aggregation_meta = json.loads(aggregation_raw)
@@ -1229,43 +1667,60 @@ def handle_question(question):
         print(format_aggregation_answer(aggregation_meta, result))
         return
 
-    needs_tool = "是" if qtype != "未知" else "否"
-    tools = select_tools(qtype, scenario)
+    answer = "暂不支持该问题类型，或缺少客户ID"
 
-    answer = f"回答占位: 客户 {user_id} 的问题" if user_id else "回答占位: 问题"
-
+    # 2. 综合建议书
     if user_id and qtype == "综合建议书生成":
         answer = generate_retirement_report(user_id, question, scenario)
 
-    elif user_id and "养老金缺口计算" in qtype:
+    # 3. 养老金缺口计算
+    elif user_id and qtype in [
+        "养老金缺口计算-月支出",
+        "养老金缺口计算-最低积累",
+        "养老金缺口计算-可积累",
+    ]:
         answer = pension_gap_calculation(user_id, qtype, scenario)
 
-    elif user_id and qtype.startswith("客户信息查询"):
+    # 4. 客户信息查询-年龄
+    elif user_id and qtype == "客户信息查询-年龄":
+        age_val = query_customer_field(user_id, "Age")
+        if age_val is not None:
+            answer = f"{int(round(age_val))} 岁"
+        else:
+            answer = "年龄未知，无法计算"
+
+    # 5. 客户信息查询-退休
+    elif user_id and qtype == "客户信息查询-退休":
         age_val = query_customer_field(user_id, "Age")
         gender = query_customer_field(user_id, "Gender") or "男"
 
         if age_val is not None:
-            if qtype == "客户信息查询-年龄":
-                answer = f"{int(round(age_val))} 岁"
-            elif qtype == "客户信息查询-退休":
-                years, months = calculate_time_to_retirement(age_val, gender, scenario=scenario)
-                answer = f"{user_id}还有 {years} 年 {months} 月退休"
+            years, months = calculate_time_to_retirement(age_val, gender, scenario=scenario)
+            answer = f" {years} 年 {months} 月"
         else:
-            answer = f"{user_id}年龄未知，无法计算"
+            answer = "年龄未知，无法计算"
 
+    # 6. 投资配置建议
     elif user_id and qtype == "投资配置建议":
         answer = investment_allocation(user_id, question, scenario)
 
+    # 7. 客户行为偏好分析
     elif user_id and qtype == "客户行为偏好分析":
         answer = customer_behavior_preference(user_id)
 
+    # 8. 客户购买预测
     elif user_id and qtype == "客户购买预测":
         answer = customer_purchase_prediction(user_id)
 
-    print(f"{answer}")
-#    print(f"问题类型：{qtype}")
-    #    print(f"是否需要工具：{needs_tool}")
-    #    print(f"工具清单：{', '.join(tools) if tools else '无'}")
+    # 9. 已识别类型但缺少客户ID
+    elif qtype != "未知" and not user_id:
+        answer = "未识别客户ID，无法回答该问题"
+
+    else:
+        answer = "抱歉，我无法理解该问题"
+
+    print(f"问题类型：{qtype}")
+    print(answer)
 # ------------------------------
 # 命令行运行
 # ------------------------------
