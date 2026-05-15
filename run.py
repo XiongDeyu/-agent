@@ -170,6 +170,26 @@ LLM_CLASSIFIER_SYSTEM_PROMPT = """你是养老规划 Agent 的问题类型识别
 只输出类型字符串。
 """
 
+OTHER_ADVICE_SYSTEM_PROMPT = """你是养老规划 Agent 中的“其他建议生成 Skill”。
+
+你的任务：
+只生成养老规划建议书中的第 7 章“其他建议”。
+
+你必须严格遵守：
+1. 只输出第 7 章，不要输出其他章节。
+2. 输出格式必须为：
+7. 其他建议
+• 建议1
+• 建议2
+• 建议3
+（可输出 3 到 5 条建议）
+3. 建议要从客户经理后续沟通视角出发，结合输入中的结构化事实。
+4. 不要重新计算金额，不要修改已有测算结果，不要改动已有配置比例。
+5. 不要编造输入中不存在的信息，不要推荐超出客户风险评级的产品。
+6. 不要承诺收益，禁止使用“保证收益”“稳赚”“无风险”等表述。
+7. 使用正式、清晰、可直接用于沟通的话术；每条建议 1 到 2 句话。
+"""
+
 VALID_QTYPES = {
     "客户信息查询-年龄",
     "客户信息查询-退休",
@@ -1043,6 +1063,79 @@ def summarize_retirement_goal(question, user_id, scenario=None):
     return "；".join(goal_parts) + "。"
 
 
+def _normalize_other_advice_output(raw_text):
+    text = (raw_text or "").strip()
+    if not text:
+        return ""
+
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:text|markdown)?\s*", "", text, flags=re.IGNORECASE)
+        text = re.sub(r"\s*```$", "", text)
+        text = text.strip()
+
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    advice_lines = [line for line in lines if line.startswith("•")]
+
+    if len(advice_lines) < 3:
+        return ""
+
+    advice_lines = advice_lines[:5]
+    return "7. 其他建议\n" + "\n".join(advice_lines)
+
+
+def generate_other_advice_with_llm(report_context):
+    user_prompt = (
+        "以下是客户养老规划结构化信息，请仅基于这些事实生成第7章“其他建议”：\n"
+        + json.dumps(report_context, ensure_ascii=False)
+    )
+    content = call_one_api_chat([
+        {"role": "system", "content": OTHER_ADVICE_SYSTEM_PROMPT},
+        {"role": "user", "content": user_prompt},
+    ])
+    normalized = _normalize_other_advice_output(content)
+    if normalized:
+        return normalized
+
+    age = report_context.get("age")
+    risk_level = report_context.get("risk_level", "暂无数据")
+    years_to_retire = int(report_context.get("years_to_retire") or 0)
+    gap = report_context.get("gap")
+    behavior_preference = report_context.get("behavior_preference", "")
+    allocation_plan = str(report_context.get("allocation_plan", "") or "")
+    enterprise_ann = report_context.get("enterprise_ann", "无")
+
+    suggestions = []
+
+    if (isinstance(age, (int, float)) and age <= 35) or years_to_retire >= 20:
+        suggestions.append("• 客户距退休时间较长，建议客户经理重点沟通尽早、持续进行养老储备，并通过长期纪律性投入提升资金积累效率。")
+
+    if isinstance(gap, (int, float)) and gap > 0:
+        suggestions.append("• 当前测算显示仍有养老资金缺口，建议客户经理引导客户提升每月养老储备并优化支出结构，同时按年度复盘目标达成进度。")
+    elif isinstance(gap, (int, float)):
+        suggestions.append("• 当前测算已可覆盖养老目标，建议客户经理与客户确认继续保持现有储蓄纪律，并按季度复盘资产配置与风险承受能力变化。")
+
+    if risk_level in ("R1", "R2"):
+        suggestions.append("• 客户风险评级偏稳健，建议后续以低风险、稳健型产品为主，并在沟通中充分说明产品风险收益特征与适配边界。")
+    elif risk_level == "R3":
+        suggestions.append("• 客户风险评级为R3，建议在稳健底仓基础上适度关注长期收益潜力产品，并保留必要流动性资产以应对阶段性资金需求。")
+    elif risk_level in ("R4", "R5"):
+        suggestions.append("• 客户风险承受能力较高，建议在评级允许范围内提升长期收益潜力配置，但仍保留养老资金的稳健底仓以降低过度波动影响。")
+
+    if behavior_preference == "现金理财":
+        suggestions.append("• 客户历史行为偏好现金理财，建议客户经理进一步确认其偏好来源（流动性、安全性或认知因素），再在合规前提下优化现金类资产占比。")
+
+    if "年金险" in allocation_plan:
+        suggestions.append("• 当前方案包含年金险，建议客户经理重点说明其在补充退休后长期现金流与应对长寿风险方面的作用，强化客户对配置目的的理解。")
+
+    if enterprise_ann not in ("无", None, "", 0):
+        suggestions.append("• 客户已具备企业年金安排，建议客户经理进一步确认领取时间、领取方式及税务规则，并纳入退休现金流统筹管理。")
+
+    if len(suggestions) < 3:
+        suggestions.append("• 建议客户经理与客户建立定期复盘机制，重点跟踪收入、支出、风险评级及养老目标变化，并在合规前提下动态优化既有配置。")
+
+    return "7. 其他建议\n" + "\n".join(suggestions[:5])
+
+
 # ------------------------------
 # 养老金缺口计算 Skill
 # ------------------------------
@@ -1615,6 +1708,23 @@ def generate_retirement_report(user_id, question, scenario=None):
 
     allocation_plan = investment_allocation(user_id, allocation_question, scenario)
     allocation_plan_detail = explain_allocation_with_gap_coverage(user_id, allocation_plan, scenario)
+    report_context = {
+        "user_id": user_id,
+        "age": age,
+        "risk_level": risk_level,
+        "retire_distance": retire_distance_text,
+        "years_to_retire": years_to_retire,
+        "monthly_surplus": monthly_surplus,
+        "min_required": min_required,
+        "total_savings": total_savings,
+        "gap": gap,
+        "behavior_preference": behavior_preference,
+        "behavior_count": behavior_count,
+        "allocation_plan": allocation_plan_detail,
+        "goal_summary": summarize_retirement_goal(question, user_id, scenario),
+        "enterprise_ann": enterprise_ann_text,
+    }
+    other_advice_text = generate_other_advice_with_llm(report_context)
 
     report = f"""1. 基本情况
 客户 ID：{user_id}，年龄：{age} 岁，性别：{gender}，风险评级：{risk_level}。当前净资产：{fmt_money(net_asset)}，每月结余：{fmt_money(monthly_surplus)}（月收入 {fmt_money(monthly_income)} − 月支出 {fmt_money(monthly_expend)}）。每月退休金：{fmt_money(pension)}，企业年金（一次性提取）：{enterprise_ann_text}。
@@ -1634,8 +1744,7 @@ def generate_retirement_report(user_id, question, scenario=None):
 {allocation_title}：
 {allocation_plan_detail}
 
-7. 其他建议
-TODO：后续接入大模型后，可补充税务规划、家庭保障、医疗支出、长期护理、遗产安排、再平衡机制等综合建议。"""
+{other_advice_text}"""
 
     return report
 
