@@ -189,6 +189,8 @@ OTHER_ADVICE_SYSTEM_PROMPT = """你是养老规划 Agent 中的“其他建议�
 6. 不要承诺收益，禁止使用“保证收益”“稳赚”“无风险”等表述。
 7. 使用正式、清晰、可直接用于沟通的话术；每条建议 1 到 2 句话。
 """
+OTHER_ADVICE_EARLY_AGE_THRESHOLD = 35
+OTHER_ADVICE_LONG_HORIZON_YEARS = 20
 
 VALID_QTYPES = {
     "客户信息查询-年龄",
@@ -1074,9 +1076,16 @@ def _normalize_other_advice_output(raw_text):
         text = text.strip()
 
     lines = [line.strip() for line in text.splitlines() if line.strip()]
-    advice_lines = [line for line in lines if line.startswith("•")]
+    bullet_pattern = re.compile(r"^(?:•|-|\*|\d+[\.、])\s*")
+    advice_lines = []
+    for line in lines:
+        if bullet_pattern.match(line):
+            normalized_line = re.sub(bullet_pattern, "", line).strip()
+            if normalized_line:
+                advice_lines.append(f"• {normalized_line}")
 
     if len(advice_lines) < 3:
+        print(f"WARNING: 其他建议条数不足，实际为 {len(advice_lines)} 条", file=sys.stderr)
         return ""
 
     advice_lines = advice_lines[:5]
@@ -1084,6 +1093,20 @@ def _normalize_other_advice_output(raw_text):
 
 
 def generate_other_advice_with_llm(report_context):
+    def safe_int(value, default=0):
+        try:
+            return int(float(value))
+        except (TypeError, ValueError):
+            return default
+
+    def has_enterprise_annuity(value):
+        if value in (None, "", "无"):
+            return False
+        if isinstance(value, (int, float)):
+            return value != 0
+        text = str(value).strip()
+        return text not in ("", "0", "0.0", "无", "0元")
+
     user_prompt = (
         "以下是客户养老规划结构化信息，请仅基于这些事实生成第7章“其他建议”：\n"
         + json.dumps(report_context, ensure_ascii=False)
@@ -1098,7 +1121,7 @@ def generate_other_advice_with_llm(report_context):
 
     age = report_context.get("age")
     risk_level = report_context.get("risk_level", "暂无数据")
-    years_to_retire = int(report_context.get("years_to_retire") or 0)
+    years_to_retire = safe_int(report_context.get("years_to_retire"), 0)
     gap = report_context.get("gap")
     behavior_preference = report_context.get("behavior_preference", "")
     allocation_plan = str(report_context.get("allocation_plan", "") or "")
@@ -1106,7 +1129,7 @@ def generate_other_advice_with_llm(report_context):
 
     suggestions = []
 
-    if (isinstance(age, (int, float)) and age <= 35) or years_to_retire >= 20:
+    if (isinstance(age, (int, float)) and age <= OTHER_ADVICE_EARLY_AGE_THRESHOLD) or years_to_retire >= OTHER_ADVICE_LONG_HORIZON_YEARS:
         suggestions.append("• 客户距退休时间较长，建议客户经理重点沟通尽早、持续进行养老储备，并通过长期纪律性投入提升资金积累效率。")
 
     if isinstance(gap, (int, float)) and gap > 0:
@@ -1127,7 +1150,7 @@ def generate_other_advice_with_llm(report_context):
     if "年金险" in allocation_plan:
         suggestions.append("• 当前方案包含年金险，建议客户经理重点说明其在补充退休后长期现金流与应对长寿风险方面的作用，强化客户对配置目的的理解。")
 
-    if enterprise_ann not in ("无", None, "", 0):
+    if has_enterprise_annuity(enterprise_ann):
         suggestions.append("• 客户已具备企业年金安排，建议客户经理进一步确认领取时间、领取方式及税务规则，并纳入退休现金流统筹管理。")
 
     if len(suggestions) < 3:
