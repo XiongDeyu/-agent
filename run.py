@@ -277,6 +277,62 @@ def generate_aggregation_sql_json(question):
     return json.dumps(result, ensure_ascii=False)
 
 
+def execute_aggregation_query(sql_template):
+    sql = re.sub(r"\bBASE_TABLE\b", BASE_TABLE, sql_template, flags=re.IGNORECASE)
+    sql = re.sub(r"\bACTION_TABLE\b", ACTION_TABLE, sql, flags=re.IGNORECASE)
+
+    conn = None
+    try:
+        conn = get_connection()
+        with conn.cursor() as cursor:
+            cursor.execute(sql)
+            row = cursor.fetchone()
+            if not row:
+                return None
+
+            if isinstance(row, dict):
+                if "result" in row:
+                    return row["result"]
+                for value in row.values():
+                    return value
+                return None
+
+            if isinstance(row, (list, tuple)) and row:
+                return row[0]
+
+            return row
+    except Exception:
+        return None
+    finally:
+        if conn:
+            conn.close()
+
+
+def format_aggregation_answer(meta, value):
+    if value is None:
+        return "暂无数据"
+
+    if isinstance(value, Decimal):
+        value = float(value)
+
+    answer_type = str(meta.get("answer_type", "unknown") or "unknown")
+    rounding = str(meta.get("rounding", "none") or "none")
+    unit = str(meta.get("unit", "无") or "无")
+
+    try:
+        numeric = float(value)
+        if answer_type == "count" or rounding == "integer":
+            value_text = str(int(round(numeric)))
+        else:
+            value_text = f"{numeric:.4f}".rstrip("0").rstrip(".")
+    except Exception:
+        value_text = str(value)
+
+    if unit != "无":
+        return f"{value_text}{unit}"
+    return value_text
+
+
 # ------------------------------
 # 提取客户ID
 # ------------------------------
@@ -1151,7 +1207,18 @@ TODO：后续接入大模型后，可补充税务规划、家庭保障、医疗�
 # ------------------------------
 def handle_question(question):
     if is_aggregation_query_candidate(question):
-        print(generate_aggregation_sql_json(question))
+        aggregation_raw = generate_aggregation_sql_json(question)
+        try:
+            aggregation_meta = json.loads(aggregation_raw)
+        except Exception:
+            aggregation_meta = dict(AGGREGATION_FALLBACK)
+
+        if not aggregation_meta.get("is_aggregation_query") or not aggregation_meta.get("sql"):
+            print(str(aggregation_meta.get("brief", "无法识别为聚合查询")))
+            return
+
+        result = execute_aggregation_query(str(aggregation_meta.get("sql", "")))
+        print(format_aggregation_answer(aggregation_meta, result))
         return
 
     user_id = extract_user_id(question)
