@@ -2,20 +2,23 @@
 import re
 import sys
 import os
+import json
 import pymysql
 import math
+import urllib.request
+import urllib.error
 from datetime import date
 from decimal import Decimal
 
 # ------------------------------
 # 数据库配置（环境变量读取）
 # ------------------------------
-DB_HOST      = os.getenv("TASK2_DB_HOST", "172.16.48.27")
-DB_PORT      = int(os.getenv("TASK2_DB_PORT", "3306"))
-DB_USER      = os.getenv("TASK2_DB_USER", "test_user")
-DB_PASSWORD  = os.getenv("TASK2_DB_PASSWORD", "R6#pV9@kT3!xM2$q")
-DB_NAME      = os.getenv("TASK2_DB_NAME", "cmb_contest")
-BASE_TABLE   = os.getenv("TASK2_BASE_TABLE", "train_base_table")
+DB_HOST = os.getenv("TASK2_DB_HOST", "172.16.48.27")
+DB_PORT = int(os.getenv("TASK2_DB_PORT", "3306"))
+DB_USER = os.getenv("TASK2_DB_USER", "test_user")
+DB_PASSWORD = os.getenv("TASK2_DB_PASSWORD", "R6#pV9@kT3!xM2$q")
+DB_NAME = os.getenv("TASK2_DB_NAME", "cmb_contest")
+BASE_TABLE = os.getenv("TASK2_BASE_TABLE", "train_base_table")
 ACTION_TABLE = os.getenv("TASK2_ACTION_TABLE", "train_action_table")
 
 CURRENT_DATE = date(2025, 3, 31)
@@ -23,6 +26,80 @@ CURRENT_DATE = date(2025, 3, 31)
 INFLATION_RATE = 0.02
 INVEST_RATE = 0.02
 EXPECTED_AGE = 80
+
+ONE_API_URL = os.getenv("ONE_API_URL", "https://one-api-other.nowcoder.com/v1/chat/completions").strip()
+ONE_API_KEY = os.getenv("ONE_API_KEY", "sk-mSnm0TPploSMetcZAb3dF5D286Ad46DfBdA73275F1Bb794a").strip()
+ONE_API_MODEL = os.getenv("ONE_API_MODEL", "qwen3.6-flash").strip()
+
+AGGREGATION_SQL_SYSTEM_PROMPT = """你是养老规划 Agent 的子技能：聚合查询 SQL 生成器。
+你的任务：将用户提出的客户聚合统计问题转换为一条安全、可执行的 MySQL SELECT 查询语句。
+
+必须严格遵守：
+1) 你只负责生成 SQL，不直接回答最终数字。
+2) 最终输出必须是 JSON，且只能输出 JSON，不得输出解释/Markdown/代码块。
+3) 只能生成一条 SELECT；禁止 INSERT/UPDATE/DELETE/DROP/ALTER/CREATE/TRUNCATE；禁止多语句。
+4) 禁止 SELECT *。
+5) 只能使用 BASE_TABLE 与 ACTION_TABLE；禁止使用其他表、禁止编造字段。
+6) 聚合查询最终只能返回一个结果列，列名统一 result。
+7) 禁止在 SQL 中写真实表名，必须使用占位符 BASE_TABLE、ACTION_TABLE。
+8) 如无法确定问题含义，返回：
+{
+  "is_aggregation_query": false,
+  "sql": "",
+  "answer_type": "unknown",
+  "unit": "无",
+  "rounding": "none",
+  "brief": "无法识别为聚合查询"
+}
+
+数据表：
+- BASE_TABLE(User_ID, Age, Gender, Rsk_Cd, Net_Asset, Monthly_Income, Monthly_Expend, Pension, Enterprise_Ann)
+- ACTION_TABLE(user_id, action_typ, prod_sub_typ, prod_typ, rsk_lvl, acs_tm)
+
+产品类别映射（严格按顺序匹配）：
+1. 现金理财: prod_sub_typ='现金'
+2. 定期存款: prod_sub_typ='一般性' AND prod_typ='存款'
+3. 短债类产品: prod_typ IN ('理财','基金') AND rsk_lvl='R2'
+4. 固收+产品: prod_typ IN ('理财','基金') AND rsk_lvl='R3'
+5. 权益类产品: prod_typ='基金' AND rsk_lvl IN ('R4','R5')
+6. 年金险: prod_sub_typ IN ('税延养老年金','养老年金')
+7. 其他: 不满足以上
+且 prod_typ='非财富' 不参与财富产品行为统计。
+
+行为词映射：
+- 浏览/看过/查看/浏览过 -> action_typ IN ('浏览详情','浏览持仓')
+- 购买/买入/买过/已购买 -> action_typ='购买'
+- 收藏/关注/加入收藏 -> action_typ='收藏'
+- 仅说“行为”则不限制 action_typ
+
+比较词映射：
+- 在N次及以上/至少N次 -> HAVING COUNT(*) >= N
+- 超过N次 -> HAVING COUNT(*) > N
+- 大于/高于N -> > N
+- 不少于/不低于N -> >= N
+- 小于/低于N -> < N
+- 不超过N -> <= N
+- 等于N -> = N
+
+输出 JSON 结构固定为：
+{
+  "is_aggregation_query": true|false,
+  "sql": "SELECT ...",
+  "answer_type": "count|average|sum|max|min|unknown",
+  "unit": "个|岁|元|无",
+  "rounding": "integer|none",
+  "brief": "简短说明该 SQL 查询什么"
+}
+"""
+
+AGGREGATION_FALLBACK = {
+    "is_aggregation_query": False,
+    "sql": "",
+    "answer_type": "unknown",
+    "unit": "无",
+    "rounding": "none",
+    "brief": "无法识别为聚合查询",
+}
 
 # ------------------------------
 # 产品库
@@ -43,6 +120,7 @@ RISK_ORDER = {
     "R4": 4,
     "R5": 5,
 }
+
 
 # ------------------------------
 # 数据库连接
@@ -87,6 +165,116 @@ def query_customer_field(user_id, field):
             conn.close()
 
     return None
+
+
+def normalize_aggregation_response(raw_text):
+    text = (raw_text or "").strip()
+    if not text:
+        return dict(AGGREGATION_FALLBACK)
+
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
+        text = re.sub(r"\s*```$", "", text)
+
+    try:
+        data = json.loads(text)
+    except Exception:
+        return dict(AGGREGATION_FALLBACK)
+
+    if not isinstance(data, dict):
+        return dict(AGGREGATION_FALLBACK)
+
+    result = dict(AGGREGATION_FALLBACK)
+    result.update({
+        "is_aggregation_query": bool(data.get("is_aggregation_query", False)),
+        "sql": str(data.get("sql", "") or ""),
+        "answer_type": str(data.get("answer_type", "unknown") or "unknown"),
+        "unit": str(data.get("unit", "无") or "无"),
+        "rounding": str(data.get("rounding", "none") or "none"),
+        "brief": str(data.get("brief", "无法识别为聚合查询") or "无法识别为聚合查询"),
+    })
+
+    sql_text = result["sql"].strip()
+    lowered = sql_text.lower()
+    if not result["is_aggregation_query"]:
+        return dict(AGGREGATION_FALLBACK)
+
+    banned = ("insert ", "update ", "delete ", "drop ", "alter ", "create ", "truncate ", ";")
+    has_table_ref = ("base_table" in lowered) or ("action_table" in lowered)
+    has_result_alias = re.search(r"\bresult\b", lowered) is not None
+
+    if (
+            not sql_text
+            or not (lowered.startswith("select") or lowered.startswith("with"))
+            or "select *" in lowered
+            or any(b in lowered for b in banned)
+            or (not has_table_ref)
+            or (not has_result_alias)
+    ):
+        return dict(AGGREGATION_FALLBACK)
+
+    return result
+
+
+def call_one_api_chat(messages):
+    if not ONE_API_URL:
+        print("WARNING: ONE_API_URL 未配置，聚合查询 SQL 生成将返回降级结果", file=sys.stderr)
+        return ""
+
+    payload = {
+        "model": ONE_API_MODEL,
+        "messages": messages,
+        "temperature": 0,
+    }
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+
+    headers = {
+        "Content-Type": "application/json",
+    }
+    if ONE_API_KEY:
+        headers["Authorization"] = f"Bearer {ONE_API_KEY}"
+
+    req = urllib.request.Request(ONE_API_URL, data=body, headers=headers, method="POST")
+
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            raw = resp.read().decode("utf-8", errors="ignore")
+    except Exception as e:
+        print(f"WARNING: one-api 请求失败: {e}", file=sys.stderr)
+        return ""
+
+    try:
+        data = json.loads(raw)
+    except Exception as e:
+        print(f"WARNING: one-api 响应非 JSON: {e}", file=sys.stderr)
+        return ""
+
+    choices = data.get("choices") or []
+    if not choices:
+        return ""
+
+    message = choices[0].get("message") or {}
+    return str(message.get("content", "") or "")
+
+
+def is_aggregation_query_candidate(question):
+    q = (question or "").lower()
+    agg_words = ["多少", "平均", "总和", "总计", "最大", "最小", "count", "avg", "sum", "max", "min"]
+    behavior_words = ["浏览", "看过", "查看", "购买", "买入", "收藏", "关注", "行为", "次", "及以上", "至少", "超过"]
+    scope_words = ["客户", "年龄", "风险评级", "风评等级", "净资产", "月收入", "月支出", "退休金", "企业年金", "产品"]
+    return (any(w in q for w in agg_words) and any(w in q for w in scope_words)) or (
+            any(w in q for w in behavior_words) and any(w in q for w in agg_words)
+    )
+
+
+def generate_aggregation_sql_json(question):
+    user_prompt = f"用户问题：{question}"
+    content = call_one_api_chat([
+        {"role": "system", "content": AGGREGATION_SQL_SYSTEM_PROMPT},
+        {"role": "user", "content": user_prompt},
+    ])
+    result = normalize_aggregation_response(content)
+    return json.dumps(result, ensure_ascii=False)
 
 
 # ------------------------------
@@ -200,15 +388,15 @@ def parse_question_type(question):
     # 8. 建议书
     if any(k in q for k in ["建议书", "养老规划", "规划建议"]):
         return "综合建议书生成"
-    
+
     # 4. 投资配置建议
     if (
-        any(k in q for k in ["全部投资", "定期存款", "投资组合", "资产配置", "配置方案"])
-        or any(k in q for k in ["能否达成", "能不能达成", "能达到", "达成目标", "达标"])
-        or any(k in q for k in ["如何调整", "怎么调整", "换什么产品", "改为投资"])
-        or any(k in q for k in ["最大化收益", "收益最大", "投资收益最大化"])
-        or any(k in q for k in ["最小化风险", "风险波动"])
-        or any(k in q for k in ["增加什么产品", "什么产品的配置", "增加什么", "增加哪类产品"])
+            any(k in q for k in ["全部投资", "定期存款", "投资组合", "资产配置", "配置方案"])
+            or any(k in q for k in ["能否达成", "能不能达成", "能达到", "达成目标", "达标"])
+            or any(k in q for k in ["如何调整", "怎么调整", "换什么产品", "改为投资"])
+            or any(k in q for k in ["最大化收益", "收益最大", "投资收益最大化"])
+            or any(k in q for k in ["最小化风险", "风险波动"])
+            or any(k in q for k in ["增加什么产品", "什么产品的配置", "增加什么", "增加哪类产品"])
     ):
         return "投资配置建议"
 
@@ -237,9 +425,9 @@ def parse_question_type(question):
 
     # 7. 养老金缺口计算-月支出
     if (
-        any(k in q for k in ["刚退休时", "退休时", "退休后"])
-        and any(k in q for k in ["每月", "月"])
-        and any(k in q for k in ["支出", "花费", "消费", "需要多少钱", "需要多少"])
+            any(k in q for k in ["刚退休时", "退休时", "退休后"])
+            and any(k in q for k in ["每月", "月"])
+            and any(k in q for k in ["支出", "花费", "消费", "需要多少钱", "需要多少"])
     ):
         return "养老金缺口计算-月支出"
 
@@ -269,6 +457,8 @@ def format_retirement_age(retirement_age_months):
     if months == 0:
         return f"{years} 岁"
     return f"{years} 岁 {months} 个月"
+
+
 # ------------------------------
 # 工具映射
 # ------------------------------
@@ -282,7 +472,8 @@ def select_tools(qtype, scenario=None):
         "养老金缺口计算-最低积累": ["BaseTableQuery", "FinanceCalculator"],
         "养老金缺口计算-可积累": ["BaseTableQuery", "FinanceCalculator"],
         "投资配置建议": ["BaseTableQuery", "FinanceCalculator", "AssetOptimizer"],
-        "综合建议书生成": ["ReportGenerator", "BaseTableQuery", "FinanceCalculator", "ActionTableQuery", "AssetOptimizer"]
+        "综合建议书生成": ["ReportGenerator", "BaseTableQuery", "FinanceCalculator", "ActionTableQuery",
+                           "AssetOptimizer"]
     }
 
     tools = tools_map.get(qtype, [])
@@ -500,10 +691,12 @@ def calculate_retirement_accumulation_by_rate(user_id, annual_rate, scenario=Non
         fv_surplus = monthly_surplus * vals["months_to_retirement"]
     else:
         fv_surplus = monthly_surplus * (
-            ((1 + monthly_rate) ** vals["months_to_retirement"] - 1) / monthly_rate
+                ((1 + monthly_rate) ** vals["months_to_retirement"] - 1) / monthly_rate
         )
 
     return int(round(fv_asset + fv_surplus))
+
+
 # ------------------------------
 # 建议书目标总结
 # ------------------------------
@@ -546,12 +739,14 @@ def summarize_retirement_goal(question, user_id, scenario=None):
 
     if current_expend is not None and retired_monthly is not None:
         return (
-            "；".join(goal_parts)
-            + f"。当前每月支出为 {fmt_money(current_expend)}，按长期通胀率 {fmt_percent(INFLATION_RATE)} 测算，"
-            + f"客户刚退休时每月约需支出 {fmt_money(retired_monthly)}。"
+                "；".join(goal_parts)
+                + f"。当前每月支出为 {fmt_money(current_expend)}，按长期通胀率 {fmt_percent(INFLATION_RATE)} 测算，"
+                + f"客户刚退休时每月约需支出 {fmt_money(retired_monthly)}。"
         )
 
     return "；".join(goal_parts) + "。"
+
+
 # ------------------------------
 # 养老金缺口计算 Skill
 # ------------------------------
@@ -840,10 +1035,12 @@ def customer_purchase_prediction(user_id):
     finally:
         if conn:
             conn.close()
+
+
 # ------------------------------
 # 建议书生成 Skill
-# ------------------------------            
-            
+# ------------------------------
+
 def generate_retirement_report(user_id, question, scenario=None):
     if scenario is None:
         scenario = {}
@@ -948,11 +1145,15 @@ TODO：后续接入大模型后，可补充税务规划、家庭保障、医疗�
 
     return report
 
-            
+
 # ------------------------------
 # 主处理函数
 # ------------------------------
 def handle_question(question):
+    if is_aggregation_query_candidate(question):
+        print(generate_aggregation_sql_json(question))
+        return
+
     user_id = extract_user_id(question)
     scenario = parse_scenario_overrides(question)
     qtype = parse_question_type(question)
@@ -990,10 +1191,11 @@ def handle_question(question):
     elif user_id and qtype == "客户购买预测":
         answer = customer_purchase_prediction(user_id)
 
-#    print(f"问题类型：{qtype}")
-#    print(f"是否需要工具：{needs_tool}")
-#    print(f"工具清单：{', '.join(tools) if tools else '无'}")
+    #    print(f"问题类型：{qtype}")
+    #    print(f"是否需要工具：{needs_tool}")
+    #    print(f"工具清单：{', '.join(tools) if tools else '无'}")
     print(f"{answer}")
+
 
 # ------------------------------
 # 命令行运行
