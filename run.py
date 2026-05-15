@@ -302,7 +302,7 @@ def execute_aggregation_query(sql_template):
 
             return row
     except pymysql.MySQLError as e:
-        print(f"WARNING: 聚合查询执行失败: {e}; SQL={sql}", file=sys.stderr)
+        print(f"WARNING: 聚合查询执行失败: {e}", file=sys.stderr)
         return None
     finally:
         if conn:
@@ -1211,7 +1211,8 @@ def handle_question(question):
         aggregation_raw = generate_aggregation_sql_json(question)
         try:
             aggregation_meta = json.loads(aggregation_raw)
-        except json.JSONDecodeError:
+        except json.JSONDecodeError as e:
+            print(f"WARNING: 聚合查询 JSON 解析失败: {e}", file=sys.stderr)
             aggregation_meta = dict(AGGREGATION_FALLBACK)
 
         if not aggregation_meta.get("is_aggregation_query") or not aggregation_meta.get("sql"):
