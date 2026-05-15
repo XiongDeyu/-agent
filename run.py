@@ -1207,7 +1207,13 @@ TODO：后续接入大模型后，可补充税务规划、家庭保障、医疗�
 # 主处理函数
 # ------------------------------
 def handle_question(question):
-    if is_aggregation_query_candidate(question):
+    user_id = extract_user_id(question)
+    scenario = parse_scenario_overrides(question)
+    qtype = parse_question_type(question)
+
+    # 聚合查询通常没有单个客户 ID。
+    # 必须放在 user_id 提取和普通 qtype 识别之后，避免把“客户 V500001 需要多少钱”误判成聚合查询。
+    if user_id is None and is_aggregation_query_candidate(question):
         aggregation_raw = generate_aggregation_sql_json(question)
         try:
             aggregation_meta = json.loads(aggregation_raw)
@@ -1216,16 +1222,12 @@ def handle_question(question):
             aggregation_meta = dict(AGGREGATION_FALLBACK)
 
         if not aggregation_meta.get("is_aggregation_query") or not aggregation_meta.get("sql"):
-            print(str(aggregation_meta.get("brief", "无法识别为聚合查询")))
+            print("暂不支持该聚合查询")
             return
 
         result = execute_aggregation_query(str(aggregation_meta.get("sql", "")))
         print(format_aggregation_answer(aggregation_meta, result))
         return
-
-    user_id = extract_user_id(question)
-    scenario = parse_scenario_overrides(question)
-    qtype = parse_question_type(question)
 
     needs_tool = "是" if qtype != "未知" else "否"
     tools = select_tools(qtype, scenario)
@@ -1244,7 +1246,7 @@ def handle_question(question):
 
         if age_val is not None:
             if qtype == "客户信息查询-年龄":
-                answer = f"{user_id}今年 {int(round(age_val))} 岁"
+                answer = f"{int(round(age_val))} 岁"
             elif qtype == "客户信息查询-退休":
                 years, months = calculate_time_to_retirement(age_val, gender, scenario=scenario)
                 answer = f"{user_id}还有 {years} 年 {months} 月退休"
@@ -1260,12 +1262,10 @@ def handle_question(question):
     elif user_id and qtype == "客户购买预测":
         answer = customer_purchase_prediction(user_id)
 
-    #    print(f"问题类型：{qtype}")
+    print(f"{answer}")
+#    print(f"问题类型：{qtype}")
     #    print(f"是否需要工具：{needs_tool}")
     #    print(f"工具清单：{', '.join(tools) if tools else '无'}")
-    print(f"{answer}")
-
-
 # ------------------------------
 # 命令行运行
 # ------------------------------
