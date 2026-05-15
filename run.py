@@ -277,6 +277,63 @@ def generate_aggregation_sql_json(question):
     return json.dumps(result, ensure_ascii=False)
 
 
+def execute_aggregation_query(sql_template):
+    sql = re.sub(r"\bBASE_TABLE\b", BASE_TABLE, sql_template, flags=re.IGNORECASE)
+    sql = re.sub(r"\bACTION_TABLE\b", ACTION_TABLE, sql, flags=re.IGNORECASE)
+
+    conn = None
+    try:
+        conn = get_connection()
+        with conn.cursor() as cursor:
+            cursor.execute(sql)
+            row = cursor.fetchone()
+            if not row:
+                return None
+
+            if isinstance(row, dict):
+                if "result" in row:
+                    return row["result"]
+                for value in row.values():
+                    return value
+                return None
+
+            if isinstance(row, (list, tuple)) and row:
+                return row[0]
+
+            return row
+    except pymysql.MySQLError as e:
+        print(f"WARNING: 聚合查询执行失败: {e}", file=sys.stderr)
+        return None
+    finally:
+        if conn:
+            conn.close()
+
+
+def format_aggregation_answer(meta, value):
+    if value is None:
+        return "暂无数据"
+
+    if isinstance(value, Decimal):
+        value = float(value)
+
+    answer_type = str(meta.get("answer_type", "unknown") or "unknown")
+    rounding = str(meta.get("rounding", "none") or "none")
+    unit = str(meta.get("unit", "无") or "无")
+
+    try:
+        numeric = float(value)
+        if answer_type == "count" or rounding == "integer":
+            value_text = str(int(round(numeric)))
+        else:
+            value_text = f"{numeric:.4f}".rstrip("0").rstrip(".")
+    except (TypeError, ValueError):
+        value_text = str(value)
+
+    if unit != "无":
+        return f"{value_text}{unit}"
+    return value_text
+
+
 # ------------------------------
 # 提取客户ID
 # ------------------------------
@@ -1150,13 +1207,27 @@ TODO：后续接入大模型后，可补充税务规划、家庭保障、医疗�
 # 主处理函数
 # ------------------------------
 def handle_question(question):
-    if is_aggregation_query_candidate(question):
-        print(generate_aggregation_sql_json(question))
-        return
-
     user_id = extract_user_id(question)
     scenario = parse_scenario_overrides(question)
     qtype = parse_question_type(question)
+
+    # 聚合查询通常没有单个客户 ID。
+    # 必须放在 user_id 提取和普通 qtype 识别之后，避免把“客户 V500001 需要多少钱”误判成聚合查询。
+    if user_id is None and is_aggregation_query_candidate(question):
+        aggregation_raw = generate_aggregation_sql_json(question)
+        try:
+            aggregation_meta = json.loads(aggregation_raw)
+        except json.JSONDecodeError as e:
+            print(f"WARNING: 聚合查询 JSON 解析失败: {e}", file=sys.stderr)
+            aggregation_meta = dict(AGGREGATION_FALLBACK)
+
+        if not aggregation_meta.get("is_aggregation_query") or not aggregation_meta.get("sql"):
+            print("暂不支持该聚合查询")
+            return
+
+        result = execute_aggregation_query(str(aggregation_meta.get("sql", "")))
+        print(format_aggregation_answer(aggregation_meta, result))
+        return
 
     needs_tool = "是" if qtype != "未知" else "否"
     tools = select_tools(qtype, scenario)
@@ -1175,7 +1246,7 @@ def handle_question(question):
 
         if age_val is not None:
             if qtype == "客户信息查询-年龄":
-                answer = f"{user_id}今年 {int(round(age_val))} 岁"
+                answer = f"{int(round(age_val))} 岁"
             elif qtype == "客户信息查询-退休":
                 years, months = calculate_time_to_retirement(age_val, gender, scenario=scenario)
                 answer = f"{user_id}还有 {years} 年 {months} 月退休"
@@ -1191,12 +1262,10 @@ def handle_question(question):
     elif user_id and qtype == "客户购买预测":
         answer = customer_purchase_prediction(user_id)
 
-    #    print(f"问题类型：{qtype}")
+    print(f"{answer}")
+#    print(f"问题类型：{qtype}")
     #    print(f"是否需要工具：{needs_tool}")
     #    print(f"工具清单：{', '.join(tools) if tools else '无'}")
-    print(f"{answer}")
-
-
 # ------------------------------
 # 命令行运行
 # ------------------------------
