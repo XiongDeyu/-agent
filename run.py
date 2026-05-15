@@ -301,7 +301,7 @@ def execute_aggregation_query(sql_template):
                 return row[0]
 
             return row
-    except Exception:
+    except pymysql.MySQLError:
         return None
     finally:
         if conn:
@@ -325,7 +325,7 @@ def format_aggregation_answer(meta, value):
             value_text = str(int(round(numeric)))
         else:
             value_text = f"{numeric:.4f}".rstrip("0").rstrip(".")
-    except Exception:
+    except (TypeError, ValueError):
         value_text = str(value)
 
     if unit != "无":
@@ -1210,7 +1210,7 @@ def handle_question(question):
         aggregation_raw = generate_aggregation_sql_json(question)
         try:
             aggregation_meta = json.loads(aggregation_raw)
-        except Exception:
+        except json.JSONDecodeError:
             aggregation_meta = dict(AGGREGATION_FALLBACK)
 
         if not aggregation_meta.get("is_aggregation_query") or not aggregation_meta.get("sql"):
